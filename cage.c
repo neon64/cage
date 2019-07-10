@@ -107,6 +107,7 @@ usage(FILE *file, const char *cage)
 		"\n"
 		" -d\t Don't draw client side decorations, when possible\n"
 		" -r\t Rotate the output 90 degrees clockwise, specify up to three times\n"
+		" -t\t Enable switching between VTs\n"
 #ifdef DEBUG
 		" -D\t Turn on damage tracking debugging\n"
 #endif
@@ -121,9 +122,9 @@ parse_args(struct cg_server *server, int argc, char *argv[])
 {
 	int c;
 #ifdef DEBUG
-	while ((c = getopt(argc, argv, "drDh")) != -1) {
+	while ((c = getopt(argc, argv, "drtDh")) != -1) {
 #else
-	while ((c = getopt(argc, argv, "drh")) != -1) {
+	while ((c = getopt(argc, argv, "drth")) != -1) {
 #endif
 		switch (c) {
 		case 'd':
@@ -134,6 +135,9 @@ parse_args(struct cg_server *server, int argc, char *argv[])
 			if (server->output_transform > WL_OUTPUT_TRANSFORM_270) {
 				server->output_transform = WL_OUTPUT_TRANSFORM_NORMAL;
 			}
+			break;
+		case 't':
+			server->vt_switching = true;
 			break;
 #ifdef DEBUG
 		case 'D':

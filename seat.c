@@ -12,6 +12,7 @@
 #include <linux/input-event-codes.h>
 #include <wayland-server.h>
 #include <wlr/backend.h>
+#include <wlr/backend/multi.h>
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_data_device.h>
 #include <wlr/types/wlr_idle.h>
@@ -223,6 +224,27 @@ handle_keybinding(struct cg_server *server, xkb_keysym_t sym)
 	return true;
 }
 
+static bool handle_change_vt_keybinding(struct cg_server *server,
+		const xkb_keysym_t *pressed_keysyms, uint32_t modifiers, size_t keysyms_len) {
+	for (size_t i = 0; i < keysyms_len; ++i) {
+		xkb_keysym_t keysym = pressed_keysyms[i];
+		if (keysym >= XKB_KEY_XF86Switch_VT_1 &&
+				keysym <= XKB_KEY_XF86Switch_VT_12) {
+			if (wlr_backend_is_multi(server->backend)) {
+				struct wlr_session *session =
+					wlr_backend_get_session(server->backend);
+				if (session) {
+					unsigned vt = keysym - XKB_KEY_XF86Switch_VT_1 + 1;
+					wlr_session_change_vt(session, vt);
+				}
+			}
+			return true;
+		}
+	}
+
+	return false;
+		}
+
 static void
 handle_keyboard_key(struct wl_listener *listener, void *data)
 {
@@ -245,6 +267,10 @@ handle_keyboard_key(struct wl_listener *listener, void *data)
 		for (int i = 0; i < nsyms; i++) {
 			handled = handle_keybinding(seat->server, syms[i]);
 		}
+	}
+
+	if(seat->server->vt_switching && handle_change_vt_keybinding(seat->server, syms, modifiers, nsyms)) {
+		handled = true;
 	}
 
 	if (!handled) {
