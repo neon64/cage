@@ -30,6 +30,8 @@
 #endif
 #include <wlr/types/wlr_xdg_decoration_v1.h>
 #include <wlr/types/wlr_xdg_shell.h>
+#include <wlr/types/wlr_screencopy_v1.h>
+#include <wlr/types/wlr_xdg_output_v1.h>
 #include <wlr/util/log.h>
 #if CAGE_HAS_XWAYLAND
 #include <wlr/xwayland.h>
@@ -176,6 +178,8 @@ main(int argc, char *argv[])
 	struct wlr_data_device_manager *data_device_mgr = NULL;
 	struct wlr_server_decoration_manager *server_decoration_manager = NULL;
 	struct wlr_xdg_decoration_manager_v1 *xdg_decoration_manager = NULL;
+	struct wlr_screencopy_manager_v1 *screencopy_manager = NULL;
+	struct wlr_xdg_output_manager_v1 *output_manager = NULL;
 	struct wlr_xdg_shell *xdg_shell = NULL;
 #if CAGE_HAS_XWAYLAND
 	struct wlr_xwayland *xwayland = NULL;
@@ -300,6 +304,20 @@ main(int argc, char *argv[])
 						       WLR_SERVER_DECORATION_MANAGER_MODE_SERVER :
 						       WLR_SERVER_DECORATION_MANAGER_MODE_CLIENT);
 
+	screencopy_manager = wlr_screencopy_manager_v1_create(server.wl_display);
+	if (!screencopy_manager) {
+		wlr_log(WLR_ERROR, "Unable to create the screencopy manager");
+		ret = 1;
+		goto end;
+	}
+
+	output_manager = wlr_xdg_output_manager_v1_create(server.wl_display, server.output_layout);
+	if (!output_manager) {
+		wlr_log(WLR_ERROR, "Unable to create the output manager");
+		ret = 1;
+		goto end;
+	}
+
 #if CAGE_HAS_XWAYLAND
 	xwayland = wlr_xwayland_create(server.wl_display, compositor, true);
 	if (!xwayland) {
@@ -383,6 +401,8 @@ end:
 	wl_event_source_remove(sigint_source);
 	wl_event_source_remove(sigterm_source);
 	seat_destroy(server.seat);
+	wlr_xdg_output_manager_v1_destroy(output_manager);
+	wlr_screencopy_manager_v1_destroy(screencopy_manager);
 	wlr_server_decoration_manager_destroy(server_decoration_manager);
 	wlr_xdg_decoration_manager_v1_destroy(xdg_decoration_manager);
 	wlr_xdg_shell_destroy(xdg_shell);
