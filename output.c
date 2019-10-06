@@ -224,12 +224,11 @@ handle_output_damage_frame(struct wl_listener *listener, void *data)
 	}
 #endif
 
-	float color[4] = {0.3, 0.3, 0.3, 1.0};
 	int nrects;
 	pixman_box32_t *rects = pixman_region32_rectangles(&buffer_damage, &nrects);
 	for (int i = 0; i < nrects; i++) {
 		scissor_output(output->wlr_output, &rects[i]);
-		wlr_renderer_clear(renderer, color);
+		wlr_renderer_clear(renderer,  output->server->bg_fill_color);
 	}
 
 	struct render_data rdata = {

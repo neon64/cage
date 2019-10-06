@@ -153,6 +153,9 @@ parse_args(struct cg_server *server, int argc, char *argv[])
 		}
 	}
 
+	static const float fill_color[4] = {0.157, 0.173, 0.204, 1.0};
+	memcpy(server->bg_fill_color, fill_color, sizeof(fill_color));
+
 	if (optind >= argc) {
 		usage(stderr, argv[0]);
 		return false;
@@ -340,6 +343,8 @@ main(int argc, char *argv[])
 		ret = 1;
 	        goto end;
 	}
+
+	wlr_log(WLR_ERROR, "Starting backend");
 
 	if (!wlr_backend_start(server.backend)) {
 		wlr_log(WLR_ERROR, "Unable to start the wlroots backend");

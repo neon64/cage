@@ -40,6 +40,7 @@ struct cg_server {
 
 	bool xdg_decoration;
 	bool vt_switching;
+	float bg_fill_color[4];
 	enum wl_output_transform output_transform;
 #ifdef DEBUG
 	bool debug_damage_tracking;
