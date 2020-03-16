@@ -1,7 +1,7 @@
 /*
  * Cage: A Wayland kiosk.
  *
- * Copyright (C) 2018-2019 Jente Hidskes
+ * Copyright (C) 2018-2020 Jente Hidskes
  *
  * See the LICENSE file accompanying this file.
  */
@@ -11,7 +11,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
-#include <wayland-server.h>
+#include <wayland-server-core.h>
 #include <wlr/types/wlr_box.h>
 #include <wlr/types/wlr_output.h>
 #include <wlr/types/wlr_surface.h>
@@ -28,7 +28,7 @@ static void
 view_child_handle_commit(struct wl_listener *listener, void *data)
 {
 	struct cg_view_child *child = wl_container_of(listener, child, commit);
-	view_damage_surface(child->view);
+	view_damage_part(child->view);
 }
 
 static void subsurface_create(struct cg_view *view, struct wlr_subsurface *wlr_subsurface);
@@ -131,20 +131,27 @@ view_is_primary(struct cg_view *view)
 }
 
 bool
-view_is_transient_for(struct cg_view *child, struct cg_view *parent) {
+view_is_transient_for(struct cg_view *child, struct cg_view *parent)
+{
 	return child->impl->is_transient_for(child, parent);
 }
 
 void
-view_damage_surface(struct cg_view *view)
+view_damage_part(struct cg_view *view)
 {
-	output_damage_view_surface(view->server->output, view);
+	struct cg_output *output;
+	wl_list_for_each (output, &view->server->outputs, link) {
+		output_damage_surface(output, view->wlr_surface, view->lx, view->ly, false);
+	}
 }
 
 void
 view_damage_whole(struct cg_view *view)
 {
-	output_damage_view_whole(view->server->output, view);
+	struct cg_output *output;
+	wl_list_for_each (output, &view->server->outputs, link) {
+		output_damage_surface(output, view->wlr_surface, view->lx, view->ly, true);
+	}
 }
 
 void
@@ -153,38 +160,42 @@ view_activate(struct cg_view *view, bool activate)
 	view->impl->activate(view, activate);
 }
 
-static void
-view_maximize(struct cg_view *view)
+static bool
+view_extends_output_layout(struct cg_view *view, struct wlr_box *layout_box)
 {
-	struct cg_output *output = view->server->output;
-	int output_width, output_height;
-
-	wlr_output_transformed_resolution(output->wlr_output, &output_width, &output_height);
-	view->impl->maximize(view, output_width, output_height);
-}
-
-static void
-view_center(struct cg_view *view)
-{
-	struct wlr_output *output = view->server->output->wlr_output;
-
-	int output_width, output_height;
-	wlr_output_transformed_resolution(output, &output_width, &output_height);
-
 	int width, height;
 	view->impl->get_geometry(view, &width, &height);
 
-	view->x = (output_width - width) / 2;
-	view->y = (output_height - height) / 2;
+	return (layout_box->height < height || layout_box->width < width);
+}
+
+static void
+view_maximize(struct cg_view *view, struct wlr_box *layout_box)
+{
+	view->lx = layout_box->x;
+	view->ly = layout_box->y;
+	view->impl->maximize(view, layout_box->width, layout_box->height);
+}
+
+static void
+view_center(struct cg_view *view, struct wlr_box *layout_box)
+{
+	int width, height;
+	view->impl->get_geometry(view, &width, &height);
+
+	view->lx = (layout_box->width - width) / 2;
+	view->ly = (layout_box->height - height) / 2;
 }
 
 void
 view_position(struct cg_view *view)
 {
-	if (view_is_primary(view)) {
-		view_maximize(view);
+	struct wlr_box *layout_box = wlr_output_layout_get_box(view->server->output_layout, NULL);
+
+	if (view_is_primary(view) || view_extends_output_layout(view, layout_box)) {
+		view_maximize(view, layout_box);
 	} else {
-		view_center(view);
+		view_center(view, layout_box);
 	}
 }
 
@@ -195,6 +206,15 @@ view_for_each_surface(struct cg_view *view, wlr_surface_iterator_func_t iterator
 }
 
 void
+view_for_each_popup(struct cg_view *view, wlr_surface_iterator_func_t iterator, void *data)
+{
+	if (!view->impl->for_each_popup) {
+		return;
+	}
+	view->impl->for_each_popup(view, iterator, data);
+}
+
+void
 view_unmap(struct cg_view *view)
 {
 	wl_list_remove(&view->link);
@@ -202,7 +222,7 @@ view_unmap(struct cg_view *view)
 	wl_list_remove(&view->new_subsurface.link);
 
 	struct cg_view_child *child, *tmp;
-	wl_list_for_each_safe(child, tmp, &view->children, link) {
+	wl_list_for_each_safe (child, tmp, &view->children, link) {
 		child->destroy(child);
 	}
 
@@ -215,7 +235,7 @@ view_map(struct cg_view *view, struct wlr_surface *surface)
 	view->wlr_surface = surface;
 
 	struct wlr_subsurface *subsurface;
-	wl_list_for_each(subsurface, &view->wlr_surface->subsurfaces, parent_link) {
+	wl_list_for_each (subsurface, &view->wlr_surface->subsurfaces, parent_link) {
 		subsurface_create(view, subsurface);
 	}
 
@@ -267,8 +287,7 @@ view_destroy(struct cg_view *view)
 }
 
 void
-view_init(struct cg_view *view, struct cg_server *server, enum cg_view_type type,
-	  const struct cg_view_impl *impl)
+view_init(struct cg_view *view, struct cg_server *server, enum cg_view_type type, const struct cg_view_impl *impl)
 {
 	view->server = server;
 	view->type = type;
@@ -281,7 +300,7 @@ struct cg_view *
 view_from_wlr_surface(struct cg_server *server, struct wlr_surface *surface)
 {
 	struct cg_view *view;
-	wl_list_for_each(view, &server->views, link) {
+	wl_list_for_each (view, &server->views, link) {
 		if (view->wlr_surface == surface) {
 			return view;
 		}

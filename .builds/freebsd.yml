@@ -18,12 +18,17 @@ tasks:
   # version, instead of master, to avoid any breaking changes in wlroots.
   - wlroots: |
       cd wlroots
-      # This corresponds to the tag of 0.6.0
-      git checkout c0305f4f864543f8c3fea6f302e91c9b1d3396f3
-      meson --prefix=/usr/local build -Drootston=false -Dexamples=false
+      git checkout 0.10.0
+      meson --prefix=/usr/local build -Dexamples=false
       ninja -C build
       sudo ninja -C build install
   - build: |
       cd cage
-      PKG_CONFIG_PATH=/usr/local/lib/pkgconfig meson build -Dxwayland=true
+      PKG_CONFIG_PATH=/usr/local/lib/pkgconfig meson build --werror -Dxwayland=true
       PKG_CONFIG_PATH=/usr/local/lib/pkgconfig ninja -C build
+      rm -rf build
+  - build-no-xwayland: |
+      cd cage
+      PKG_CONFIG_PATH=/usr/local/lib/pkgconfig meson build --werror -Dxwayland=false
+      PKG_CONFIG_PATH=/usr/local/lib/pkgconfig ninja -C build
+      rm -rf build

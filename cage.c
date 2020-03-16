@@ -1,7 +1,7 @@
 /*
  * Cage: A Wayland kiosk.
  *
- * Copyright (C) 2018-2019 Jente Hidskes
+ * Copyright (C) 2018-2020 Jente Hidskes
  *
  * See the LICENSE file accompanying this file.
  */
@@ -10,28 +10,31 @@
 
 #include "config.h"
 
+#include <fcntl.h>
 #include <getopt.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <wayland-server.h>
+#include <wayland-server-core.h>
 #include <wlr/backend.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/types/wlr_data_device.h>
+#include <wlr/types/wlr_export_dmabuf_v1.h>
+#include <wlr/types/wlr_gamma_control_v1.h>
 #include <wlr/types/wlr_idle.h>
 #include <wlr/types/wlr_idle_inhibit_v1.h>
 #include <wlr/types/wlr_output_layout.h>
+#include <wlr/types/wlr_screencopy_v1.h>
 #include <wlr/types/wlr_server_decoration.h>
 #if CAGE_HAS_XWAYLAND
 #include <wlr/types/wlr_xcursor_manager.h>
 #endif
 #include <wlr/types/wlr_xdg_decoration_v1.h>
-#include <wlr/types/wlr_xdg_shell.h>
-#include <wlr/types/wlr_screencopy_v1.h>
 #include <wlr/types/wlr_xdg_output_v1.h>
+#include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/util/log.h>
 #if CAGE_HAS_XWAYLAND
 #include <wlr/xwayland.h>
@@ -47,14 +50,59 @@
 #include "xwayland.h"
 #endif
 
-static bool
-spawn_primary_client(char *argv[], pid_t *pid_out)
+static int
+sigchld_handler(int fd, uint32_t mask, void *data)
 {
+	struct wl_display *display = data;
+
+	/* Close Cage's read pipe. */
+	close(fd);
+
+	if (mask & WL_EVENT_HANGUP) {
+		wlr_log(WLR_DEBUG, "Child process closed normally");
+	} else if (mask & WL_EVENT_ERROR) {
+		wlr_log(WLR_DEBUG, "Connection closed by server");
+	}
+
+	wl_display_terminate(display);
+	return 0;
+}
+
+static bool
+set_cloexec(int fd)
+{
+	int flags = fcntl(fd, F_GETFD);
+
+	if (flags == -1) {
+		wlr_log(WLR_ERROR, "Unable to set the CLOEXEC flag: fnctl failed");
+		return false;
+	}
+
+	flags = flags | FD_CLOEXEC;
+	if (fcntl(fd, F_SETFD, flags) == -1) {
+		wlr_log(WLR_ERROR, "Unable to set the CLOEXEC flag: fnctl failed");
+		return false;
+	}
+
+	return true;
+}
+
+static bool
+spawn_primary_client(struct wl_display *display, char *argv[], pid_t *pid_out, struct wl_event_source **sigchld_source)
+{
+	int fd[2];
+	if (pipe(fd) != 0) {
+		wlr_log(WLR_ERROR, "Unable to create pipe");
+		return false;
+	}
+
 	pid_t pid = fork();
 	if (pid == 0) {
 		sigset_t set;
 		sigemptyset(&set);
 		sigprocmask(SIG_SETMASK, &set, NULL);
+		/* Close read, we only need write in the primary client process. */
+		close(fd[0]);
 		execvp(argv[0], argv);
 		_exit(1);
 	} else if (pid == -1) {
@@ -62,9 +110,36 @@ spawn_primary_client(char *argv[], pid_t *pid_out)
 		return false;
 	}
 
+	/* Set this early so that if we fail, the client process will be cleaned up properly. */
 	*pid_out = pid;
+
+	if (!set_cloexec(fd[0]) || !set_cloexec(fd[1])) {
+		return false;
+	}
+
+	/* Close write, we only need read in Cage. */
+	close(fd[1]);
+
+	struct wl_event_loop *event_loop = wl_display_get_event_loop(display);
+	uint32_t mask = WL_EVENT_HANGUP | WL_EVENT_ERROR;
+	*sigchld_source = wl_event_loop_add_fd(event_loop, fd[0], mask, sigchld_handler, display);
+
 	wlr_log(WLR_DEBUG, "Child process created with pid %d", pid);
 	return true;
+}
+
+static void
+cleanup_primary_client(pid_t pid)
+{
+	int status;
+
+	waitpid(pid, &status, 0);
+
+	if (WIFEXITED(status)) {
+		wlr_log(WLR_DEBUG, "Child exited normally with exit status %d", WEXITSTATUS(status));
+	} else if (WIFSIGNALED(status)) {
+		wlr_log(WLR_DEBUG, "Child was terminated by a signal (%d)", WTERMSIG(status));
+	}
 }
 
 static bool
@@ -78,8 +153,8 @@ drop_permissions(void)
 	}
 
 	if (setuid(0) != -1) {
-		wlr_log(WLR_ERROR, "Unable to drop root (we shouldn't be able to "
-			"restore it after setuid), refusing to start");
+		wlr_log(WLR_ERROR,
+			"Unable to drop root (we shouldn't be able to restore it after setuid), refusing to start");
 		return false;
 	}
 
@@ -98,14 +173,15 @@ handle_signal(int signal, void *data)
 		wl_display_terminate(display);
 		return 0;
 	default:
-		return 1;
+		return 0;
 	}
 }
 
 static void
 usage(FILE *file, const char *cage)
 {
-	fprintf(file, "Usage: %s [OPTIONS] [--] APPLICATION\n"
+	fprintf(file,
+		"Usage: %s [OPTIONS] [--] APPLICATION\n"
 		"\n"
 		" -d\t Don't draw client side decorations, when possible\n"
 		" -r\t Rotate the output 90 degrees clockwise, specify up to three times\n"
@@ -114,6 +190,7 @@ usage(FILE *file, const char *cage)
 		" -D\t Turn on damage tracking debugging\n"
 #endif
 		" -h\t Display this help message\n"
+		" -v\t Show the version number and exit\n"
 		"\n"
 		" Use -- when you want to pass arguments to APPLICATION\n",
 		cage);
@@ -124,9 +201,9 @@ parse_args(struct cg_server *server, int argc, char *argv[])
 {
 	int c;
 #ifdef DEBUG
-	while ((c = getopt(argc, argv, "drtDh")) != -1) {
+	while ((c = getopt(argc, argv, "drtDhv")) != -1) {
 #else
-	while ((c = getopt(argc, argv, "drth")) != -1) {
+	while ((c = getopt(argc, argv, "drthv")) != -1) {
 #endif
 		switch (c) {
 		case 'd':
@@ -149,6 +226,9 @@ parse_args(struct cg_server *server, int argc, char *argv[])
 		case 'h':
 			usage(stdout, argv[0]);
 			return false;
+		case 'v':
+			fprintf(stdout, "Cage version " CAGE_VERSION "\n");
+			exit(0);
 		default:
 			usage(stderr, argv[0]);
 			return false;
@@ -173,18 +253,23 @@ main(int argc, char *argv[])
 	struct wl_event_loop *event_loop = NULL;
 	struct wl_event_source *sigint_source = NULL;
 	struct wl_event_source *sigterm_source = NULL;
+	struct wl_event_source *sigchld_source = NULL;
+	struct wlr_backend *backend = NULL;
 	struct wlr_renderer *renderer = NULL;
 	struct wlr_compositor *compositor = NULL;
-	struct wlr_data_device_manager *data_device_mgr = NULL;
+	struct wlr_data_device_manager *data_device_manager = NULL;
 	struct wlr_server_decoration_manager *server_decoration_manager = NULL;
 	struct wlr_xdg_decoration_manager_v1 *xdg_decoration_manager = NULL;
+	struct wlr_export_dmabuf_manager_v1 *export_dmabuf_manager = NULL;
 	struct wlr_screencopy_manager_v1 *screencopy_manager = NULL;
 	struct wlr_xdg_output_manager_v1 *output_manager = NULL;
+	struct wlr_gamma_control_manager_v1 *gamma_control_manager = NULL;
 	struct wlr_xdg_shell *xdg_shell = NULL;
 #if CAGE_HAS_XWAYLAND
 	struct wlr_xwayland *xwayland = NULL;
 	struct wlr_xcursor_manager *xcursor_manager = NULL;
 #endif
+	pid_t pid = 0;
 	int ret = 0;
 
 	if (!parse_args(&server, argc, argv)) {
@@ -197,6 +282,12 @@ main(int argc, char *argv[])
 	wlr_log_init(WLR_ERROR, NULL);
 #endif
 
+	/* Wayland requires XDG_RUNTIME_DIR to be set. */
+	if (!getenv("XDG_RUNTIME_DIR")) {
+		wlr_log(WLR_ERROR, "XDG_RUNTIME_DIR is not set in the environment");
+		return 1;
+	}
+
 	server.wl_display = wl_display_create();
 	if (!server.wl_display) {
 		wlr_log(WLR_ERROR, "Cannot allocate a Wayland display");
@@ -207,8 +298,8 @@ main(int argc, char *argv[])
 	sigint_source = wl_event_loop_add_signal(event_loop, SIGINT, handle_signal, &server.wl_display);
 	sigterm_source = wl_event_loop_add_signal(event_loop, SIGTERM, handle_signal, &server.wl_display);
 
-	server.backend = wlr_backend_autocreate(server.wl_display, NULL);
-	if (!server.backend) {
+	backend = wlr_backend_autocreate(server.wl_display, NULL);
+	if (!backend) {
 		wlr_log(WLR_ERROR, "Unable to create the wlroots backend");
 		ret = 1;
 		goto end;
@@ -219,10 +310,11 @@ main(int argc, char *argv[])
 		goto end;
 	}
 
-	renderer = wlr_backend_get_renderer(server.backend);
+	renderer = wlr_backend_get_renderer(backend);
 	wlr_renderer_init_wl_display(renderer, server.wl_display);
 
 	wl_list_init(&server.views);
+	wl_list_init(&server.outputs);
 
 	server.output_layout = wlr_output_layout_create();
 	if (!server.output_layout) {
@@ -238,8 +330,8 @@ main(int argc, char *argv[])
 		goto end;
 	}
 
-	data_device_mgr = wlr_data_device_manager_create(server.wl_display);
-	if (!data_device_mgr) {
+	data_device_manager = wlr_data_device_manager_create(server.wl_display);
+	if (!data_device_manager) {
 		wlr_log(WLR_ERROR, "Unable to create the data device manager");
 		ret = 1;
 		goto end;
@@ -249,9 +341,9 @@ main(int argc, char *argv[])
 	 * available on the backend. We use this only to detect the
 	 * first output and ignore subsequent outputs. */
 	server.new_output.notify = handle_new_output;
-	wl_signal_add(&server.backend->events.new_output, &server.new_output);
+	wl_signal_add(&backend->events.new_output, &server.new_output);
 
-	server.seat = seat_create(&server);
+	server.seat = seat_create(&server, backend);
 	if (!server.seat) {
 		wlr_log(WLR_ERROR, "Unable to create the seat");
 		ret = 1;
@@ -299,10 +391,16 @@ main(int argc, char *argv[])
 		ret = 1;
 		goto end;
 	}
-	wlr_server_decoration_manager_set_default_mode(server_decoration_manager,
-						       server.xdg_decoration ?
-						       WLR_SERVER_DECORATION_MANAGER_MODE_SERVER :
-						       WLR_SERVER_DECORATION_MANAGER_MODE_CLIENT);
+	wlr_server_decoration_manager_set_default_mode(
+		server_decoration_manager, server.xdg_decoration ? WLR_SERVER_DECORATION_MANAGER_MODE_SERVER
+								 : WLR_SERVER_DECORATION_MANAGER_MODE_CLIENT);
+
+	export_dmabuf_manager = wlr_export_dmabuf_manager_v1_create(server.wl_display);
+	if (!export_dmabuf_manager) {
+		wlr_log(WLR_ERROR, "Unable to create the export DMABUF manager");
+		ret = 1;
+		goto end;
+	}
 
 	screencopy_manager = wlr_screencopy_manager_v1_create(server.wl_display);
 	if (!screencopy_manager) {
@@ -314,6 +412,13 @@ main(int argc, char *argv[])
 	output_manager = wlr_xdg_output_manager_v1_create(server.wl_display, server.output_layout);
 	if (!output_manager) {
 		wlr_log(WLR_ERROR, "Unable to create the output manager");
+		ret = 1;
+		goto end;
+	}
+
+	gamma_control_manager = wlr_gamma_control_manager_v1_create(server.wl_display);
+	if (!gamma_control_manager) {
+		wlr_log(WLR_ERROR, "Unable to create the gamma control manager");
 		ret = 1;
 		goto end;
 	}
@@ -331,13 +436,12 @@ main(int argc, char *argv[])
 	xcursor_manager = wlr_xcursor_manager_create(DEFAULT_XCURSOR, XCURSOR_SIZE);
 	if (!xcursor_manager) {
 		wlr_log(WLR_ERROR, "Cannot create XWayland XCursor manager");
-	        ret = 1;
+		ret = 1;
 		goto end;
 	}
 
 	if (setenv("DISPLAY", xwayland->display_name, true) < 0) {
-		wlr_log_errno(WLR_ERROR, "Unable to set DISPLAY for XWayland.",
-			      "Clients may not be able to connect");
+		wlr_log_errno(WLR_ERROR, "Unable to set DISPLAY for XWayland. Clients may not be able to connect");
 	} else {
 		wlr_log(WLR_DEBUG, "XWayland is running on display %s", xwayland->display_name);
 	}
@@ -345,12 +449,10 @@ main(int argc, char *argv[])
 	if (wlr_xcursor_manager_load(xcursor_manager, 1)) {
 		wlr_log(WLR_ERROR, "Cannot load XWayland XCursor theme");
 	}
-	struct wlr_xcursor *xcursor =
-		wlr_xcursor_manager_get_xcursor(xcursor_manager, DEFAULT_XCURSOR, 1);
+	struct wlr_xcursor *xcursor = wlr_xcursor_manager_get_xcursor(xcursor_manager, DEFAULT_XCURSOR, 1);
 	if (xcursor) {
 		struct wlr_xcursor_image *image = xcursor->images[0];
-		wlr_xwayland_set_cursor(xwayland, image->buffer,
-					image->width * 4, image->width, image->height,
+		wlr_xwayland_set_cursor(xwayland, image->buffer, image->width * 4, image->width, image->height,
 					image->hotspot_x, image->hotspot_y);
 	}
 #endif
@@ -359,33 +461,33 @@ main(int argc, char *argv[])
 	if (!socket) {
 		wlr_log_errno(WLR_ERROR, "Unable to open Wayland socket");
 		ret = 1;
-	        goto end;
+		goto end;
 	}
 
-	wlr_log(WLR_ERROR, "Starting backend");
-
-	if (!wlr_backend_start(server.backend)) {
+	if (!wlr_backend_start(backend)) {
 		wlr_log(WLR_ERROR, "Unable to start the wlroots backend");
 		ret = 1;
 		goto end;
 	}
 
 	if (setenv("WAYLAND_DISPLAY", socket, true) < 0) {
-		wlr_log_errno(WLR_ERROR, "Unable to set WAYLAND_DISPLAY.",
-			      "Clients may not be able to connect");
+		wlr_log_errno(WLR_ERROR, "Unable to set WAYLAND_DISPLAY. Clients may not be able to connect");
 	} else {
-		wlr_log(WLR_DEBUG, "Cage is running on Wayland display %s", socket);
+		wlr_log(WLR_DEBUG, "Cage " CAGE_VERSION " is running on Wayland display %s", socket);
 	}
 
 #if CAGE_HAS_XWAYLAND
 	wlr_xwayland_set_seat(xwayland, server.seat->seat);
 #endif
 
-	pid_t pid;
-	if (!spawn_primary_client(argv + optind, &pid)) {
+	if (!spawn_primary_client(server.wl_display, argv + optind, &pid, &sigchld_source)) {
 		ret = 1;
 		goto end;
 	}
+
+	/* Place the cursor in the center of the output layout. */
+	struct wlr_box *layout_box = wlr_output_layout_get_box(server.output_layout, NULL);
+	wlr_cursor_warp(server.seat->cursor, NULL, layout_box->width / 2, layout_box->height / 2);
 
 	wl_display_run(server.wl_display);
 
@@ -395,26 +497,18 @@ main(int argc, char *argv[])
 #endif
 	wl_display_destroy_clients(server.wl_display);
 
-	waitpid(pid, NULL, 0);
-
 end:
+	cleanup_primary_client(pid);
+
 	wl_event_source_remove(sigint_source);
 	wl_event_source_remove(sigterm_source);
-	seat_destroy(server.seat);
-	wlr_xdg_output_manager_v1_destroy(output_manager);
-	wlr_screencopy_manager_v1_destroy(screencopy_manager);
-	wlr_server_decoration_manager_destroy(server_decoration_manager);
-	wlr_xdg_decoration_manager_v1_destroy(xdg_decoration_manager);
-	wlr_xdg_shell_destroy(xdg_shell);
-	wlr_idle_inhibit_v1_destroy(server.idle_inhibit_v1);
-	if (server.idle) {
-		wlr_idle_destroy(server.idle);
+	if (sigchld_source) {
+		wl_event_source_remove(sigchld_source);
 	}
-	wlr_data_device_manager_destroy(data_device_mgr);
-	wlr_compositor_destroy(compositor);
-	wlr_output_layout_destroy(server.output_layout);
+	seat_destroy(server.seat);
 	/* This function is not null-safe, but we only ever get here
 	   with a proper wl_display. */
 	wl_display_destroy(server.wl_display);
+	wlr_output_layout_destroy(server.output_layout);
 	return ret;
 }

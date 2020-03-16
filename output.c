@@ -1,7 +1,8 @@
 /*
  * Cage: A Wayland kiosk.
  *
- * Copyright (C) 2018-2019 Jente Hidskes
+ * Copyright (C) 2018-2020 Jente Hidskes
+ * Copyright (C) 2019 The Sway authors
  *
  * See the LICENSE file accompanying this file.
  */
@@ -9,13 +10,13 @@
 #define _POSIX_C_SOURCE 200112L
 
 #include "config.h"
-#include <wlr/config.h>
 
 #include <stdlib.h>
 #include <unistd.h>
-#include <wayland-server.h>
+#include <wayland-server-core.h>
 #include <wlr/backend.h>
 #include <wlr/backend/wayland.h>
+#include <wlr/config.h>
 #if WLR_HAS_X11_BACKEND
 #include <wlr/backend/x11.h>
 #endif
@@ -31,67 +32,223 @@
 #include <wlr/util/region.h>
 
 #include "output.h"
+#include "render.h"
+#include "seat.h"
 #include "server.h"
+#include "util.h"
 #include "view.h"
+#if CAGE_HAS_XWAYLAND
+#include "xwayland.h"
+#endif
 
-static void
-scissor_output(struct wlr_output *output, pixman_box32_t *rect)
-{
-	struct wlr_renderer *renderer = wlr_backend_get_renderer(output->backend);
+static void output_for_each_surface(struct cg_output *output, cg_surface_iterator_func_t iterator, void *user_data);
 
-	struct wlr_box box = {
-		.x = rect->x1,
-		.y = rect->y1,
-		.width = rect->x2 - rect->x1,
-		.height = rect->y2 - rect->y1,
-	};
+struct surface_iterator_data {
+	cg_surface_iterator_func_t user_iterator;
+	void *user_data;
 
-	int output_width, output_height;
-	wlr_output_transformed_resolution(output, &output_width, &output_height);
-	enum wl_output_transform transform = wlr_output_transform_invert(output->transform);
-	wlr_box_transform(&box, &box, transform, output_width, output_height);
-
-	wlr_renderer_scissor(renderer, &box);
-}
-
-static void
-send_frame_done(struct wlr_surface *surface, int _unused, int _not_used, void *data)
-{
-	struct timespec *now = data;
-	wlr_surface_send_frame_done(surface, now);
-}
-
-/* Used to move all of the data necessary to damage a surface. */
-struct damage_data {
 	struct cg_output *output;
-	double x;
-	double y;
-	bool whole;
+
+	/* Output-local coordinates. */
+	double ox, oy;
 };
 
-static void
-damage_surface(struct wlr_surface *surface, int sx, int sy, void *data)
+static bool
+intersects_with_output(struct cg_output *output, struct wlr_output_layout *output_layout, struct wlr_box *surface_box)
 {
-	struct damage_data *ddata = data;
-	struct cg_output *output = ddata->output;
-	struct wlr_output *wlr_output = output->wlr_output;
+	/* Since the surface_box's x- and y-coordinates are already output local,
+	 * the x- and y-coordinates of this box need to be 0 for this function to
+	 * work correctly. */
+	struct wlr_box output_box = {0};
+	wlr_output_effective_resolution(output->wlr_output, &output_box.width, &output_box.height);
+
+	struct wlr_box intersection;
+	return wlr_box_intersection(&intersection, &output_box, surface_box);
+}
+
+static void
+output_for_each_surface_iterator(struct wlr_surface *surface, int sx, int sy, void *user_data)
+{
+	struct surface_iterator_data *data = user_data;
+	struct cg_output *output = data->output;
 
 	if (!wlr_surface_has_buffer(surface)) {
 		return;
 	}
 
-	double x = ddata->x + sx, y = ddata->y + sy;
-	wlr_output_layout_output_coords(output->server->output_layout, wlr_output, &x, &y);
-
-	struct wlr_box box = {
-		.x = x * wlr_output->scale,
-		.y = y * wlr_output->scale,
-		.width = surface->current.width * wlr_output->scale,
-		.height = surface->current.height * wlr_output->scale,
+	struct wlr_box surface_box = {
+		.x = data->ox + sx + surface->sx,
+		.y = data->oy + sy + surface->sy,
+		.width = surface->current.width,
+		.height = surface->current.height,
 	};
 
-	if (ddata->whole) {
-		wlr_output_damage_add_box(output->damage, &box);
+	if (!intersects_with_output(output, output->server->output_layout, &surface_box)) {
+		return;
+	}
+
+	data->user_iterator(data->output, surface, &surface_box, data->user_data);
+}
+
+void
+output_surface_for_each_surface(struct cg_output *output, struct wlr_surface *surface, double ox, double oy,
+				cg_surface_iterator_func_t iterator, void *user_data)
+{
+	struct surface_iterator_data data = {
+		.user_iterator = iterator,
+		.user_data = user_data,
+		.output = output,
+		.ox = ox,
+		.oy = oy,
+	};
+
+	wlr_surface_for_each_surface(surface, output_for_each_surface_iterator, &data);
+}
+
+static void
+output_view_for_each_surface(struct cg_output *output, struct cg_view *view, cg_surface_iterator_func_t iterator,
+			     void *user_data)
+{
+	struct surface_iterator_data data = {
+		.user_iterator = iterator,
+		.user_data = user_data,
+		.output = output,
+		.ox = view->lx,
+		.oy = view->ly,
+	};
+
+	wlr_output_layout_output_coords(output->server->output_layout, output->wlr_output, &data.ox, &data.oy);
+	view_for_each_surface(view, output_for_each_surface_iterator, &data);
+}
+
+void
+output_view_for_each_popup(struct cg_output *output, struct cg_view *view, cg_surface_iterator_func_t iterator,
+			   void *user_data)
+{
+	struct surface_iterator_data data = {
+		.user_iterator = iterator,
+		.user_data = user_data,
+		.output = output,
+		.ox = view->lx,
+		.oy = view->ly,
+	};
+
+	wlr_output_layout_output_coords(output->server->output_layout, output->wlr_output, &data.ox, &data.oy);
+	view_for_each_popup(view, output_for_each_surface_iterator, &data);
+}
+
+void
+output_drag_icons_for_each_surface(struct cg_output *output, struct wl_list *drag_icons,
+				   cg_surface_iterator_func_t iterator, void *user_data)
+{
+	struct cg_drag_icon *drag_icon;
+	wl_list_for_each (drag_icon, drag_icons, link) {
+		if (drag_icon->wlr_drag_icon->mapped) {
+			double ox = drag_icon->lx;
+			double oy = drag_icon->ly;
+			wlr_output_layout_output_coords(output->server->output_layout, output->wlr_output, &ox, &oy);
+			output_surface_for_each_surface(output, drag_icon->wlr_drag_icon->surface, ox, oy, iterator,
+							user_data);
+		}
+	}
+}
+
+static void
+output_for_each_surface(struct cg_output *output, cg_surface_iterator_func_t iterator, void *user_data)
+{
+	struct cg_view *view;
+	wl_list_for_each_reverse (view, &output->server->views, link) {
+		output_view_for_each_surface(output, view, iterator, user_data);
+	}
+
+	output_drag_icons_for_each_surface(output, &output->server->seat->drag_icons, iterator, user_data);
+}
+
+struct send_frame_done_data {
+	struct timespec when;
+};
+
+static void
+send_frame_done_iterator(struct cg_output *output, struct wlr_surface *surface, struct wlr_box *box, void *user_data)
+{
+	struct send_frame_done_data *data = user_data;
+	wlr_surface_send_frame_done(surface, &data->when);
+}
+
+static void
+send_frame_done(struct cg_output *output, struct send_frame_done_data *data)
+{
+	output_for_each_surface(output, send_frame_done_iterator, data);
+}
+
+static void
+count_surface_iterator(struct cg_output *output, struct wlr_surface *surface, struct wlr_box *_box, void *data)
+{
+	size_t *n = data;
+	n++;
+}
+
+static bool
+scan_out_primary_view(struct cg_output *output)
+{
+	struct cg_server *server = output->server;
+	struct wlr_output *wlr_output = output->wlr_output;
+
+	struct cg_drag_icon *drag_icon;
+	wl_list_for_each (drag_icon, &server->seat->drag_icons, link) {
+		if (drag_icon->wlr_drag_icon->mapped) {
+			return false;
+		}
+	}
+
+	struct cg_view *view = seat_get_focus(server->seat);
+	if (!view || !view->wlr_surface) {
+		return false;
+	}
+
+	size_t n_surfaces = 0;
+	output_view_for_each_surface(output, view, count_surface_iterator, &n_surfaces);
+	if (n_surfaces > 1) {
+		return false;
+	}
+
+#if CAGE_HAS_XWAYLAND
+	if (view->type == CAGE_XWAYLAND_VIEW) {
+		struct cg_xwayland_view *xwayland_view = xwayland_view_from_view(view);
+		if (!wl_list_empty(&xwayland_view->xwayland_surface->children)) {
+			return false;
+		}
+	}
+#endif
+
+	struct wlr_surface *surface = view->wlr_surface;
+
+	if (!surface->buffer) {
+		return false;
+	}
+
+	if ((float) surface->current.scale != wlr_output->scale ||
+	    surface->current.transform != wlr_output->transform) {
+		return false;
+	}
+
+	if (!wlr_output_attach_buffer(wlr_output, surface->buffer)) {
+		return false;
+	}
+
+	return wlr_output_commit(wlr_output);
+}
+
+static void
+damage_surface_iterator(struct cg_output *output, struct wlr_surface *surface, struct wlr_box *box, void *user_data)
+{
+	struct wlr_output *wlr_output = output->wlr_output;
+	bool whole = *(bool *) user_data;
+
+	scale_box(box, output->wlr_output->scale);
+
+	if (whole) {
+		wlr_output_damage_add_box(output->damage, box);
 	} else if (pixman_region32_not_empty(&surface->buffer_damage)) {
 		pixman_region32_t damage;
 		pixman_region32_init(&damage);
@@ -102,188 +259,69 @@ damage_surface(struct wlr_surface *surface, int sx, int sy, void *data)
 			/* When scaling up a surface it'll become
 			   blurry, so we need to expand the damage
 			   region. */
-			wlr_region_expand(&damage, &damage,
-					  ceil(wlr_output->scale) - surface->current.scale);
+			wlr_region_expand(&damage, &damage, ceil(wlr_output->scale) - surface->current.scale);
 		}
-		pixman_region32_translate(&damage, box.x, box.y);
+		pixman_region32_translate(&damage, box->x, box->y);
 		wlr_output_damage_add(output->damage, &damage);
 		pixman_region32_fini(&damage);
 	}
 }
 
-/* Used to move all of the data necessary to render a surface from the
- * top-level frame handler to the per-surface render function. */
-struct render_data {
-	struct wlr_output_layout *output_layout;
-	struct wlr_output *output;
-	struct timespec *when;
-	pixman_region32_t *damage;
-	double x, y;
-};
-
-static void
-render_surface(struct wlr_surface *surface, int sx, int sy, void *data)
+void
+output_damage_surface(struct cg_output *output, struct wlr_surface *surface, double lx, double ly, bool whole)
 {
-	struct render_data *rdata = data;
-	struct wlr_output *output = rdata->output;
-
-	if (!wlr_surface_has_buffer(surface)) {
-		return;
-	}
-
-	struct wlr_texture *texture = wlr_surface_get_texture(surface);
-	if (!texture) {
-		wlr_log(WLR_DEBUG, "Cannot obtain surface texture");
-		return;
-	}
-
-	double x = rdata->x + sx, y = rdata->y + sy;
-	wlr_output_layout_output_coords(rdata->output_layout, output, &x, &y);
-
-	struct wlr_box box = {
-		.x = x * output->scale,
-		.y = y * output->scale,
-		.width = surface->current.width * output->scale,
-		.height = surface->current.height * output->scale,
-	};
-
-	pixman_region32_t damage;
-	pixman_region32_init(&damage);
-	pixman_region32_union_rect(&damage, &damage, box.x, box.y, box.width, box.height);
-	pixman_region32_intersect(&damage, &damage, rdata->damage);
-	if (!pixman_region32_not_empty(&damage)) {
-		goto buffer_damage_finish;
-	}
-
-	float matrix[9];
-	enum wl_output_transform transform = wlr_output_transform_invert(surface->current.transform);
-	wlr_matrix_project_box(matrix, &box, transform, 0, output->transform_matrix);
-
-	int nrects;
-	pixman_box32_t *rects = pixman_region32_rectangles(&damage, &nrects);
-	for (int i = 0; i < nrects; i++) {
-		scissor_output(output, &rects[i]);
-		wlr_render_texture_with_matrix(surface->renderer, texture, matrix, 1);
-	}
-
- buffer_damage_finish:
-	pixman_region32_fini(&damage);
-}
-
-static void
-drag_icons_for_each_surface(struct cg_server *server, wlr_surface_iterator_func_t iterator,
-			    void *data)
-{
-	struct render_data *rdata = data;
-
-	struct cg_drag_icon *drag_icon;
-	wl_list_for_each(drag_icon, &server->seat->drag_icons, link) {
-		if (!drag_icon->wlr_drag_icon->mapped) {
-			continue;
-		}
-		rdata->x = drag_icon->x;
-		rdata->y = drag_icon->y;
-		wlr_surface_for_each_surface(drag_icon->wlr_drag_icon->surface,
-					     iterator,
-					     data);
-	}
+	double ox = lx, oy = ly;
+	wlr_output_layout_output_coords(output->server->output_layout, output->wlr_output, &ox, &oy);
+	output_surface_for_each_surface(output, surface, ox, oy, damage_surface_iterator, &whole);
 }
 
 static void
 handle_output_damage_frame(struct wl_listener *listener, void *data)
 {
 	struct cg_output *output = wl_container_of(listener, output, damage_frame);
-	struct wlr_renderer *renderer = wlr_backend_get_renderer(output->server->backend);
+	struct send_frame_done_data frame_data = {0};
 
-	struct timespec now;
-	clock_gettime(CLOCK_MONOTONIC, &now);
+	if (!output->wlr_output->enabled) {
+		return;
+	}
+
+	/* Check if we can scan-out the primary view. */
+	static bool last_scanned_out = false;
+	bool scanned_out = scan_out_primary_view(output);
+
+	if (scanned_out && !last_scanned_out) {
+		wlr_log(WLR_DEBUG, "Scanning out primary view");
+	}
+	if (last_scanned_out && !scanned_out) {
+		wlr_log(WLR_DEBUG, "Stopping primary view scan out");
+	}
+	last_scanned_out = scanned_out;
+
+	if (scanned_out) {
+		goto frame_done;
+	}
 
 	bool needs_frame;
-	pixman_region32_t buffer_damage;
-	pixman_region32_init(&buffer_damage);
-	if (!wlr_output_damage_attach_render(output->damage, &needs_frame, &buffer_damage)) {
+	pixman_region32_t damage;
+	pixman_region32_init(&damage);
+	if (!wlr_output_damage_attach_render(output->damage, &needs_frame, &damage)) {
 		wlr_log(WLR_ERROR, "Cannot make damage output current");
-		goto buffer_damage_finish;
+		goto damage_finish;
 	}
 
 	if (!needs_frame) {
-		wlr_log(WLR_DEBUG, "Output doesn't need frame and isn't damaged");
-		goto buffer_damage_finish;
+		wlr_output_rollback(output->wlr_output);
+		goto damage_finish;
 	}
 
-	wlr_renderer_begin(renderer, output->wlr_output->width, output->wlr_output->height);
+	output_render(output, &damage);
 
-	if (!pixman_region32_not_empty(&buffer_damage)) {
-		wlr_log(WLR_DEBUG, "Output isn't damaged but needs a buffer frame");
-		goto renderer_end;
-	}
+damage_finish:
+	pixman_region32_fini(&damage);
 
-#ifdef DEBUG
-	if (output->server->debug_damage_tracking) {
-		wlr_renderer_clear(renderer, (float[]){1, 0, 0, 1});
-	}
-#endif
-
-	int nrects;
-	pixman_box32_t *rects = pixman_region32_rectangles(&buffer_damage, &nrects);
-	for (int i = 0; i < nrects; i++) {
-		scissor_output(output->wlr_output, &rects[i]);
-		wlr_renderer_clear(renderer,  output->server->bg_fill_color);
-	}
-
-	struct render_data rdata = {
-		.output_layout = output->server->output_layout,
-		.output = output->wlr_output,
-		.when = &now,
-		.damage = &buffer_damage,
-	};
-
-	struct cg_view *view;
-	wl_list_for_each_reverse(view, &output->server->views, link) {
-		rdata.x = view->x;
-		rdata.y = view->y;
-		view_for_each_surface(view, render_surface, &rdata);
-	}
-
-	drag_icons_for_each_surface(output->server, render_surface, &rdata);
-
- renderer_end:
-	/* Draw software cursor in case hardware cursors aren't
-	   available. This is a no-op when they are. */
-	wlr_output_render_software_cursors(output->wlr_output, &buffer_damage);
-	wlr_renderer_scissor(renderer, NULL);
-	wlr_renderer_end(renderer);
-
-	int output_width, output_height;
-	wlr_output_transformed_resolution(output->wlr_output, &output_width, &output_height);
-
-	pixman_region32_t frame_damage;
-	pixman_region32_init(&frame_damage);
-
-	enum wl_output_transform transform = wlr_output_transform_invert(output->wlr_output->transform);
-	wlr_region_transform(&frame_damage, &output->damage->current, transform, output_width, output_height);
-
-#ifdef DEBUG
-	if (output->server->debug_damage_tracking) {
-		pixman_region32_union_rect(&frame_damage, &frame_damage, 0, 0, output_width, output_height);
-	}
-#endif
-
-	wlr_output_set_damage(output->wlr_output, &frame_damage);
-	pixman_region32_fini(&frame_damage);
-
-	if (!wlr_output_commit(output->wlr_output)) {
-	        wlr_log(WLR_ERROR, "Could not commit output");
-		goto buffer_damage_finish;
-	}
-
- buffer_damage_finish:
-	pixman_region32_fini(&buffer_damage);
-
-	wl_list_for_each_reverse(view, &output->server->views, link) {
-		view_for_each_surface(view, send_frame_done, &now);
-	}
-	drag_icons_for_each_surface(output->server, send_frame_done, &now);
+frame_done:
+	clock_gettime(CLOCK_MONOTONIC, &frame_data.when);
+	send_frame_done(output, &frame_data);
 }
 
 static void
@@ -291,8 +329,12 @@ handle_output_transform(struct wl_listener *listener, void *data)
 {
 	struct cg_output *output = wl_container_of(listener, output, transform);
 
+	if (!output->wlr_output->enabled) {
+		return;
+	}
+
 	struct cg_view *view;
-	wl_list_for_each(view, &output->server->views, link) {
+	wl_list_for_each (view, &output->server->views, link) {
 		view_position(view);
 	}
 }
@@ -302,8 +344,12 @@ handle_output_mode(struct wl_listener *listener, void *data)
 {
 	struct cg_output *output = wl_container_of(listener, output, mode);
 
+	if (!output->wlr_output->enabled) {
+		return;
+	}
+
 	struct cg_view *view;
-	wl_list_for_each(view, &output->server->views, link) {
+	wl_list_for_each (view, &output->server->views, link) {
 		view_position(view);
 	}
 }
@@ -318,12 +364,20 @@ output_destroy(struct cg_output *output)
 	wl_list_remove(&output->transform.link);
 	wl_list_remove(&output->damage_frame.link);
 	wl_list_remove(&output->damage_destroy.link);
-	free(output);
-	server->output = NULL;
+	wl_list_remove(&output->link);
 
-	/* Since there is no use in continuing without our (single)
-	 * output, terminate. */
-	wl_display_terminate(server->wl_display);
+	wlr_output_layout_remove(server->output_layout, output->wlr_output);
+
+	struct cg_view *view;
+	wl_list_for_each (view, &output->server->views, link) {
+		view_position(view);
+	}
+
+	free(output);
+
+	if (wl_list_empty(&server->outputs)) {
+		wl_display_terminate(server->wl_display);
+	}
 }
 
 static void
@@ -346,83 +400,50 @@ handle_new_output(struct wl_listener *listener, void *data)
 {
 	struct cg_server *server = wl_container_of(listener, server, new_output);
 	struct wlr_output *wlr_output = data;
-	struct wlr_output_mode *preferred_mode;
 
-	preferred_mode = wlr_output_preferred_mode(wlr_output);
+	struct cg_output *output = calloc(1, sizeof(struct cg_output));
+	if (!output) {
+		wlr_log(WLR_ERROR, "Failed to allocate output");
+		return;
+	}
+
+	output->wlr_output = wlr_output;
+	output->server = server;
+	output->damage = wlr_output_damage_create(wlr_output);
+	wl_list_insert(&server->outputs, &output->link);
+
+	output->mode.notify = handle_output_mode;
+	wl_signal_add(&wlr_output->events.mode, &output->mode);
+	output->transform.notify = handle_output_transform;
+	wl_signal_add(&wlr_output->events.transform, &output->transform);
+	output->destroy.notify = handle_output_destroy;
+	wl_signal_add(&wlr_output->events.destroy, &output->destroy);
+	output->damage_frame.notify = handle_output_damage_frame;
+	wl_signal_add(&output->damage->events.frame, &output->damage_frame);
+	output->damage_destroy.notify = handle_output_damage_destroy;
+	wl_signal_add(&output->damage->events.destroy, &output->damage_destroy);
+
+	struct wlr_output_mode *preferred_mode = wlr_output_preferred_mode(wlr_output);
 	if (preferred_mode) {
 		wlr_output_set_mode(wlr_output, preferred_mode);
 	}
-
-	server->output = calloc(1, sizeof(struct cg_output));
-	server->output->wlr_output = wlr_output;
-	server->output->server = server;
-	server->output->damage = wlr_output_damage_create(wlr_output);
-
-	server->output->mode.notify = handle_output_mode;
-	wl_signal_add(&wlr_output->events.mode, &server->output->mode);
-	server->output->transform.notify = handle_output_transform;
-	wl_signal_add(&wlr_output->events.transform, &server->output->transform);
-	server->output->destroy.notify = handle_output_destroy;
-	wl_signal_add(&wlr_output->events.destroy, &server->output->destroy);
-	server->output->damage_frame.notify = handle_output_damage_frame;
-	wl_signal_add(&server->output->damage->events.frame, &server->output->damage_frame);
-	server->output->damage_destroy.notify = handle_output_damage_destroy;
-	wl_signal_add(&server->output->damage->events.destroy, &server->output->damage_destroy);
-
 	wlr_output_set_transform(wlr_output, server->output_transform);
-
 	wlr_output_layout_add_auto(server->output_layout, wlr_output);
 
-	/* Disconnect the signal now, because we only use one static output. */
-	wl_list_remove(&server->new_output.link);
+	struct cg_view *view;
+	wl_list_for_each (view, &output->server->views, link) {
+		view_position(view);
+	}
 
 	if (wlr_xcursor_manager_load(server->seat->xcursor_manager, wlr_output->scale)) {
-		wlr_log(WLR_ERROR, "Cannot load XCursor theme for output '%s' with scale %f",
-			wlr_output->name,
+		wlr_log(WLR_ERROR, "Cannot load XCursor theme for output '%s' with scale %f", wlr_output->name,
 			wlr_output->scale);
 	}
 
-	/* Place the cursor in the center of the screen. */
-	wlr_cursor_warp(server->seat->cursor, NULL, wlr_output->width / 2, wlr_output->height / 2);
-	wlr_output_damage_add_whole(server->output->damage);
-}
+	wlr_output_enable(wlr_output, true);
+	wlr_output_commit(wlr_output);
 
-void
-output_damage_view_surface(struct cg_output *cg_output, struct cg_view *view)
-{
-	struct damage_data data = {
-		.output = cg_output,
-		.x = view->x,
-		.y = view->y,
-		.whole = false,
-	};
-	view_for_each_surface(view, damage_surface, &data);
-}
-
-void
-output_damage_view_whole(struct cg_output *cg_output, struct cg_view *view)
-{
-	struct damage_data data = {
-		.output = cg_output,
-		.x = view->x,
-		.y = view->y,
-		.whole = true,
-	};
-	view_for_each_surface(view, damage_surface, &data);
-}
-
-void
-output_damage_drag_icon(struct cg_output *cg_output, struct cg_drag_icon *drag_icon)
-{
-	struct damage_data data = {
-		.output = cg_output,
-		.x = drag_icon->x,
-		.y = drag_icon->y,
-		.whole = true,
-	};
-	wlr_surface_for_each_surface(drag_icon->wlr_drag_icon->surface,
-				     damage_surface,
-				     &data);
+	wlr_output_damage_add_whole(output->damage);
 }
 
 void

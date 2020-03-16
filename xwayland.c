@@ -1,17 +1,17 @@
 /*
  * Cage: A Wayland kiosk.
  *
- * Copyright (C) 2018-2019 Jente Hidskes
+ * Copyright (C) 2018-2020 Jente Hidskes
  *
  * See the LICENSE file accompanying this file.
  */
 
 #include <stdbool.h>
 #include <stdlib.h>
-#include <wayland-server.h>
+#include <wayland-server-core.h>
 #include <wlr/types/wlr_box.h>
-#include <wlr/xwayland.h>
 #include <wlr/util/log.h>
+#include <wlr/xwayland.h>
 
 #include "server.h"
 #include "view.h"
@@ -84,7 +84,8 @@ static void
 maximize(struct cg_view *view, int output_width, int output_height)
 {
 	struct cg_xwayland_view *xwayland_view = xwayland_view_from_view(view);
-	wlr_xwayland_surface_configure(xwayland_view->xwayland_surface, 0, 0, output_width, output_height);
+	wlr_xwayland_surface_configure(xwayland_view->xwayland_surface, view->lx, view->ly, output_width,
+				       output_height);
 	wlr_xwayland_surface_set_maximized(xwayland_view->xwayland_surface, true);
 }
 
@@ -120,7 +121,7 @@ handle_xwayland_surface_commit(struct wl_listener *listener, void *data)
 {
 	struct cg_xwayland_view *xwayland_view = wl_container_of(listener, xwayland_view, commit);
 	struct cg_view *view = &xwayland_view->view;
-	view_damage_surface(view);
+	view_damage_part(view);
 }
 
 static void
@@ -143,8 +144,8 @@ handle_xwayland_surface_map(struct wl_listener *listener, void *data)
 	struct cg_view *view = &xwayland_view->view;
 
 	if (!xwayland_view_should_manage(view)) {
-		view->x = xwayland_view->xwayland_surface->x;
-		view->y = xwayland_view->xwayland_surface->y;
+		view->lx = xwayland_view->xwayland_surface->x;
+		view->ly = xwayland_view->xwayland_surface->y;
 	}
 
 	xwayland_view->commit.notify = handle_xwayland_surface_commit;
@@ -180,6 +181,8 @@ static const struct cg_view_impl xwayland_view_impl = {
 	.maximize = maximize,
 	.destroy = destroy,
 	.for_each_surface = for_each_surface,
+	/* XWayland doesn't have a separate popup iterator. */
+	.for_each_popup = NULL,
 	.wlr_surface_at = wlr_surface_at,
 };
 

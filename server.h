@@ -3,8 +3,7 @@
 
 #include "config.h"
 
-#include <wayland-server.h>
-#include <wlr/backend.h>
+#include <wayland-server-core.h>
 #include <wlr/types/wlr_idle.h>
 #include <wlr/types/wlr_idle_inhibit_v1.h>
 #include <wlr/types/wlr_output_layout.h>
@@ -19,7 +18,6 @@
 
 struct cg_server {
 	struct wl_display *wl_display;
-	struct wlr_backend *backend;
 	struct wl_list views;
 
 	struct cg_seat *seat;
@@ -29,7 +27,7 @@ struct cg_server {
 	struct wl_list inhibitors;
 
 	struct wlr_output_layout *output_layout;
-	struct cg_output *output;
+	struct wl_list outputs;
 	struct wl_listener new_output;
 
 	struct wl_listener xdg_toplevel_decoration;

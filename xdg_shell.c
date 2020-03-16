@@ -8,7 +8,7 @@
 
 #include <stdbool.h>
 #include <stdlib.h>
-#include <wayland-server.h>
+#include <wayland-server-core.h>
 #include <wlr/types/wlr_box.h>
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/util/log.h>
@@ -93,16 +93,19 @@ static void
 popup_unconstrain(struct cg_xdg_popup *popup)
 {
 	struct cg_view *view = popup->view_child.view;
-	struct wlr_output *output = view->server->output->wlr_output;
-	struct wlr_output_layout *output_layout = view->server->output_layout;
+	struct cg_server *server = view->server;
+	struct wlr_box *popup_box = &popup->wlr_popup->geometry;
 
-	struct wlr_box *output_box = wlr_output_layout_get_box(output_layout, output);
+	struct wlr_output_layout *output_layout = server->output_layout;
+	struct wlr_output *wlr_output =
+		wlr_output_layout_output_at(output_layout, view->lx + popup_box->x, view->ly + popup_box->y);
+	struct wlr_box *output_box = wlr_output_layout_get_box(output_layout, wlr_output);
 
 	struct wlr_box output_toplevel_box = {
-		.x = output_box->x - view->x,
-		.y = output_box->y - view->y,
+		.x = output_box->x - view->lx,
+		.y = output_box->y - view->ly,
 		.width = output_box->width,
-		.height = output_box->height
+		.height = output_box->height,
 	};
 
 	wlr_xdg_popup_unconstrain_from_box(popup->wlr_popup, &output_toplevel_box);
@@ -220,6 +223,13 @@ for_each_surface(struct cg_view *view, wlr_surface_iterator_func_t iterator, voi
 	wlr_xdg_surface_for_each_surface(xdg_shell_view->xdg_surface, iterator, data);
 }
 
+static void
+for_each_popup(struct cg_view *view, wlr_surface_iterator_func_t iterator, void *data)
+{
+	struct cg_xdg_shell_view *xdg_shell_view = xdg_shell_view_from_view(view);
+	wlr_xdg_surface_for_each_popup(xdg_shell_view->xdg_surface, iterator, data);
+}
+
 static struct wlr_surface *
 wlr_surface_at(struct cg_view *view, double sx, double sy, double *sub_x, double *sub_y)
 {
@@ -240,7 +250,7 @@ handle_xdg_shell_surface_commit(struct wl_listener *listener, void *data)
 {
 	struct cg_xdg_shell_view *xdg_shell_view = wl_container_of(listener, xdg_shell_view, commit);
 	struct cg_view *view = &xdg_shell_view->view;
-	view_damage_surface(view);
+	view_damage_part(view);
 }
 
 static void
@@ -295,6 +305,7 @@ static const struct cg_view_impl xdg_shell_view_impl = {
 	.maximize = maximize,
 	.destroy = destroy,
 	.for_each_surface = for_each_surface,
+	.for_each_popup = for_each_popup,
 	.wlr_surface_at = wlr_surface_at,
 };
 

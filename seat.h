@@ -1,7 +1,7 @@
 #ifndef CG_SEAT_H
 #define CG_SEAT_H
 
-#include <wayland-server.h>
+#include <wayland-server-core.h>
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_data_device.h>
 #include <wlr/types/wlr_input_device.h>
@@ -20,6 +20,7 @@ struct cg_seat {
 	struct wl_listener destroy;
 
 	struct wl_list keyboards;
+	struct wl_list keyboard_groups;
 	struct wl_list pointers;
 	struct wl_list touch;
 	struct wl_listener new_input;
@@ -33,8 +34,8 @@ struct cg_seat {
 	struct wl_listener cursor_frame;
 
 	int32_t touch_id;
-	double touch_x;
-	double touch_y;
+	double touch_lx;
+	double touch_ly;
 	struct wl_listener touch_down;
 	struct wl_listener touch_up;
 	struct wl_listener touch_motion;
@@ -48,14 +49,12 @@ struct cg_seat {
 	struct wl_listener request_set_primary_selection;
 };
 
-struct cg_keyboard {
-	struct wl_list link; // seat::keyboards
+struct cg_keyboard_group {
+	struct wlr_keyboard_group *wlr_group;
 	struct cg_seat *seat;
-	struct wlr_input_device *device;
-
-	struct wl_listener modifiers;
 	struct wl_listener key;
-	struct wl_listener destroy;
+	struct wl_listener modifiers;
+	struct wl_list link; // cg_seat::keyboard_groups
 };
 
 struct cg_pointer {
@@ -78,13 +77,14 @@ struct cg_drag_icon {
 	struct wl_list link; // seat::drag_icons
 	struct cg_seat *seat;
 	struct wlr_drag_icon *wlr_drag_icon;
-	double x;
-	double y;
+
+	/* The drag icon has a position in layout coordinates. */
+	double lx, ly;
 
 	struct wl_listener destroy;
 };
 
-struct cg_seat *seat_create(struct cg_server *server);
+struct cg_seat *seat_create(struct cg_server *server, struct wlr_backend *backend);
 void seat_destroy(struct cg_seat *seat);
 struct cg_view *seat_get_focus(struct cg_seat *seat);
 void seat_set_focus(struct cg_seat *seat, struct cg_view *view);

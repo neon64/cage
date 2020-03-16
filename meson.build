@@ -4,7 +4,6 @@ project('cage', 'c',
   default_options: [
     'c_std=c11',
     'warning_level=3',
-    'werror=true',
   ],
 )
 
@@ -35,7 +34,7 @@ if is_freebsd
   )
 endif
 
-wlroots        = dependency('wlroots', version: '>= 0.6.0')
+wlroots        = dependency('wlroots', version: '>= 0.9.1')
 wayland_protos = dependency('wayland-protocols', version: '>=1.14')
 wayland_server = dependency('wayland-server')
 pixman         = dependency('pixman-1')
@@ -76,14 +75,31 @@ else
   have_xwayland = false
 endif
 
+version = '@0@'.format(meson.project_version())
+git = find_program('git', native: true, required: false)
+if git.found()
+  git_commit = run_command([git, 'rev-parse', '--short', 'HEAD'])
+  git_branch = run_command([git, 'rev-parse', '--abbrev-ref', 'HEAD'])
+  if git_commit.returncode() == 0 and git_branch.returncode() == 0
+    version = '@0@-@1@ (branch \'@2@\')'.format(
+      meson.project_version(),
+      git_commit.stdout().strip(),
+      git_branch.stdout().strip(),
+    )
+  endif
+endif
+
 conf_data = configuration_data()
 conf_data.set10('CAGE_HAS_XWAYLAND', have_xwayland)
+conf_data.set_quoted('CAGE_VERSION', version)
 
 cage_sources = [
   'cage.c',
   'idle_inhibit_v1.c',
   'output.c',
+  'render.c',
   'seat.c',
+  'util.c',
   'view.c',
   'xdg_shell.c',
 ]
@@ -94,8 +110,10 @@ cage_headers = [
 		 configuration: conf_data),
   'idle_inhibit_v1.h',
   'output.h',
+  'render.h',
   'seat.h',
   'server.h',
+  'util.h',
   'view.h',
   'xdg_shell.h',
 ]
@@ -121,9 +139,9 @@ executable(
 
 summary = [
 	'',
-	'Cage @0@'.format(meson.project_version()),
+	'Cage @0@'.format(version),
 	'',
-	'    xwayland: @0@'.format(conf_data.get('CAGE_HAS_XWAYLAND', false)),
+	'    xwayland: @0@'.format(have_xwayland),
 	''
 ]
 message('\n'.join(summary))
